@@ -1,4 +1,4 @@
-# step3_port_scan.py - UPDATED to show OPEN PORTS
+# step3_port_scan.py - UPDATED with connection tracking and data capture
 from scapy.all import *
 from collections import defaultdict
 import argparse
@@ -34,63 +34,14 @@ def get_port_service(port):
     }
     return services.get(port, "Unknown")
 
-def detect_open_ports(packets, scanner_ip, victim_ip):
-    """
-    Detect which ports are actually open based on SYN-ACK responses
-    """
-    print(f"\n    [*] Checking which ports are OPEN on {victim_ip}...")
-    
-    open_ports = set()
-    open_port_details = []
-    
-    for packet in packets:
-        # Look for SYN-ACK responses from victim to scanner
-        if (packet.haslayer(IP) and packet.haslayer(TCP) and
-            packet[IP].src == victim_ip and 
-            packet[IP].dst == scanner_ip):
-            
-            # SYN-ACK (flags = 'SA') means port is OPEN
-            if packet[TCP].flags == 'SA':
-                port = packet[TCP].sport
-                open_ports.add(port)
-                open_port_details.append({
-                    'port': port,
-                    'service': get_port_service(port),
-                    'time': float(packet.time)
-                })
-    
-    if open_ports:
-        print(f"    [!!!] OPEN PORTS FOUND on {victim_ip}:")
-        for port in sorted(open_ports):
-            service = get_port_service(port)
-            print(f"          Port {port}: {service} - OPEN")
-        
-        # Show which ports the attacker can now target
-        print(f"\n    [⚠] ATTACK SURFACE DETECTED:")
-        for port in sorted(open_ports)[:10]:  # Show first 10
-            service = get_port_service(port)
-            if port == 22:
-                print(f"          → Port {port} (SSH): Can be brute-forced")
-            elif port == 21:
-                print(f"          → Port {port} (FTP): Credentials sent in clear text")
-            elif port == 80 or port == 443:
-                print(f"          → Port {port} ({service}): Web attacks possible")
-            elif port == 3389:
-                print(f"          → Port {port} (RDP): Remote desktop vulnerable")
-            else:
-                print(f"          → Port {port} ({service}): Potential vulnerability")
-    else:
-        print(f"    No open ports detected (all ports closed or filtered)")
-    
-    return open_ports
-
 def detect_port_scan(packets, threshold=3):
     """
     Detect port scans by counting unique ports accessed by each source IP
+    Also track completed handshakes and data capture
     threshold: minimum number of unique ports to consider as scan
     """
     print("\n" + "=" * 70)
-    print("PORT SCAN DETECTION - WITH OPEN PORT ANALYSIS")
+    print("PORT SCAN DETECTION - WITH CONNECTION TRACKING")
     print("=" * 70)
     
     # Dictionary to store: source IP -> set of destination ports
@@ -102,16 +53,31 @@ def detect_port_scan(packets, threshold=3):
     # Dictionary to store detailed info for reporting
     scan_details = defaultdict(list)
     
+    # NEW: Track open ports per victim
+    open_ports = defaultdict(lambda: defaultdict(set))
+    
+    # NEW: Track completed handshakes
+    completed_handshakes = defaultdict(lambda: defaultdict(list))
+    
+    # NEW: Track data captured
+    data_captured = defaultdict(lambda: defaultdict(list))
+    
+    # Track TCP connection states
+    connections = {}  # (src, dst, sport, dport) -> state
+    
     # Analyze each packet
     for packet in packets:
         # Check if packet has IP and TCP layers
         if packet.haslayer(IP) and packet.haslayer(TCP):
             src_ip = packet[IP].src
             dst_ip = packet[IP].dst
+            sport = packet[TCP].sport
             dst_port = packet[TCP].dport
+            flags = packet[TCP].flags
+            conn_key = (src_ip, dst_ip, sport, dst_port)
             
             # Track scanning attempts (SYN packets)
-            if packet[TCP].flags == 'S':
+            if flags == 'S':
                 port_scanners[src_ip].add(dst_port)
                 scanner_victims[src_ip].add(dst_ip)
                 
@@ -119,12 +85,78 @@ def detect_port_scan(packets, threshold=3):
                 scan_details[src_ip].append({
                     'dst_ip': dst_ip,
                     'dst_port': dst_port,
-                    'flags': packet[TCP].flags,
+                    'flags': 'SYN',
                     'time': float(packet.time)
                 })
+                connections[conn_key] = 'SYN_SENT'
+            
+            # SYN-ACK response means port is open
+            elif flags == 'SA':
+                # This is response from victim to scanner
+                if dst_ip in port_scanners:  # dst_ip is the scanner
+                    victim_ip = src_ip
+                    scanner_ip = dst_ip
+                    open_port = sport
+                    
+                    open_ports[scanner_ip][victim_ip].add(open_port)
+                    
+                    # Track potential handshake completion
+                    reverse_key = (dst_ip, src_ip, dst_port, sport)  # (scanner, victim, scanner_port, victim_port)
+                    connections[reverse_key] = 'SYN_RCVD'
+            
+            # ACK might complete handshake
+            elif flags == 'A':
+                if conn_key in connections and connections[conn_key] == 'SYN_RCVD':
+                    connections[conn_key] = 'ESTABLISHED'
+                    
+                    # Handshake completed!
+                    scanner_ip = src_ip
+                    victim_ip = dst_ip
+                    victim_port = dst_port
+                    
+                    completed_handshakes[scanner_ip][victim_ip].append({
+                        'port': victim_port,
+                        'time': float(packet.time),
+                        'service': get_port_service(victim_port)
+                    })
+            
+            # Data packets on established connections
+            if packet.haslayer(Raw):
+                if conn_key in connections and connections[conn_key] == 'ESTABLISHED':
+                    scanner_ip = src_ip
+                    victim_ip = dst_ip
+                    victim_port = dst_port
+                    
+                    # Check direction
+                    if scanner_ip in port_scanners:
+                        direction = "ATTACKER -> VICTIM"
+                    else:
+                        scanner_ip = dst_ip
+                        victim_ip = src_ip
+                        victim_port = sport
+                        direction = "VICTIM -> ATTACKER (DATA LEAK)"
+                    
+                    payload = bytes(packet[Raw].load)
+                    
+                    # Try to decode
+                    try:
+                        data_str = payload.decode('utf-8', errors='ignore')[:100]
+                    except:
+                        data_str = str(payload)[:100]
+                    
+                    data_captured[scanner_ip][victim_ip].append({
+                        'port': victim_port,
+                        'time': float(packet.time),
+                        'direction': direction,
+                        'data': data_str,
+                        'size': len(payload)
+                    })
     
     # Report findings
     scans_found = False
+    total_handshakes = 0
+    total_data_packets = 0
+    
     for src_ip, ports in port_scanners.items():
         if len(ports) >= threshold:
             scans_found = True
@@ -143,31 +175,52 @@ def detect_port_scan(packets, threshold=3):
             else:
                 print(f"    Ports: {port_list}")
             
-            # Show the first few scan attempts
+            # Show open ports for each victim
+            for victim_ip in scanner_victims[src_ip]:
+                if victim_ip in open_ports[src_ip]:
+                    print(f"\n    🎯 TARGET: {victim_ip}")
+                    print(f"    🔓 OPEN PORTS FOUND:")
+                    
+                    for port in sorted(open_ports[src_ip][victim_ip]):
+                        service = get_port_service(port)
+                        
+                        # Check if handshake completed
+                        handshake_completed = False
+                        for h in completed_handshakes[src_ip][victim_ip]:
+                            if h['port'] == port:
+                                handshake_completed = True
+                                total_handshakes += 1
+                                break
+                        
+                        if handshake_completed:
+                            print(f"        • Port {port} ({service}) - 🔴 HANDSHAKE COMPLETE")
+                            
+                            # Show captured data
+                            captured = [d for d in data_captured[src_ip][victim_ip] if d['port'] == port]
+                            if captured:
+                                total_data_packets += len(captured)
+                                print(f"          📥 DATA CAPTURED ({len(captured)} packets):")
+                                for cap in captured[:2]:
+                                    print(f"            [{cap['direction']}] {cap['data']}")
+                        else:
+                            print(f"        • Port {port} ({service}) - 🟢 OPEN")
+                    
+                    # Show attack impact for this victim
+                    if completed_handshakes[src_ip][victim_ip]:
+                        print(f"\n    🔴 ATTACK IMPACT:")
+                        print(f"        • Handshakes completed: {len(completed_handshakes[src_ip][victim_ip])}")
+                        
+                        victim_data = len(data_captured[src_ip][victim_ip])
+                        if victim_data > 0:
+                            print(f"        • Data packets captured: {victim_data}")
+                            
+                            victim_bytes = sum(d['size'] for d in data_captured[src_ip][victim_ip])
+                            print(f"        • Total data volume: {victim_bytes} bytes")
+            
             print(f"\n    First 5 scan attempts:")
             for i, detail in enumerate(scan_details[src_ip][:5]):
                 time_str = f"Packet {i+1}"
-                print(f"      {time_str}: To {detail['dst_ip']}:{detail['dst_port']} (Flags: {detail['flags']})")
-            
-            # NOW CHECK FOR OPEN PORTS ON EACH VICTIM
-            print(f"\n    {'-'*50}")
-            print(f"    ANALYZING ATTACK RESULTS:")
-            print(f"    {'-'*50}")
-            for victim_ip in scanner_victims[src_ip]:
-                open_ports = detect_open_ports(packets, src_ip, victim_ip)
-                
-                # If open ports found, show attack summary
-                if open_ports:
-                    print(f"\n    [🔥] CRITICAL: Attacker found {len(open_ports)} open ports on {victim_ip}")
-                    
-                    # Most dangerous open ports
-                    dangerous_ports = [p for p in open_ports if p in [21,22,23,3389,3306,5432]]
-                    if dangerous_ports:
-                        print(f"    [⚠] DANGEROUS PORTS EXPOSED:")
-                        for p in dangerous_ports:
-                            service = get_port_service(p)
-                            risk = "HIGH" if p in [21,22,23] else "MEDIUM"
-                            print(f"          Port {p} ({service}) - {risk} RISK")
+                print(f"      {time_str}: To {detail['dst_ip']}:{detail['dst_port']}")
     
     if not scans_found:
         print("\n[+] No port scans detected")
@@ -178,7 +231,11 @@ def detect_port_scan(packets, threshold=3):
         print("SCAN SUMMARY")
         print("="*70)
         print(f"Total scanners detected: {len([ip for ip in port_scanners if len(port_scanners[ip]) >= threshold])}")
-        print(f"Most scanned port: Find with further analysis")
+        
+        if total_handshakes > 0:
+            print(f"Total completed handshakes: {total_handshakes} - 🔴 ATTACKER CONNECTED")
+        if total_data_packets > 0:
+            print(f"Total data packets captured: {total_data_packets} - 🔴 DATA COMPROMISED")
         print("="*70)
     
     return port_scanners

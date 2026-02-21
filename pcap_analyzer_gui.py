@@ -480,69 +480,229 @@ class PCAPAnalyzerGUI:
             self.status_label.config(text=f"❌ Error: {str(e)}")
             
     def enhanced_port_scan_analysis(self):
-        """Enhanced port scan detection with more details"""
         self.port_text.insert(tk.END, "="*80 + "\n", 'info')
         self.port_text.insert(tk.END, "🔍 ENHANCED PORT SCAN ANALYSIS\n", 'warning')
         self.port_text.insert(tk.END, "="*80 + "\n\n", 'info')
-        
-        scanners = defaultdict(lambda: {'ports': set(), 'victims': set(), 'packets': []})
-        
+    
+    # Track scanners and their connections
+        scanners = defaultdict(lambda: {
+            'ports': set(), 
+            'victims': set(), 
+            'packets': [],
+            'open_ports': defaultdict(set),  # victim -> set of open ports
+            'established': defaultdict(list),  # Completed handshakes
+            'data_captured': defaultdict(list)  # Data from established connections
+        })
+    
+    # Track TCP connection states
+        connections = {}  # (src, dst, sport, dport) -> state
+    
         for packet in self.packets:
             if packet.haslayer(IP) and packet.haslayer(TCP):
-                if packet[TCP].flags == 'S':
-                    src = packet[IP].src
-                    dst = packet[IP].dst
-                    port = packet[TCP].dport
-                    
-                    scanners[src]['ports'].add(port)
+                src = packet[IP].src
+                dst = packet[IP].dst
+                sport = packet[TCP].sport
+                dport = packet[TCP].dport
+                flags = packet[TCP].flags
+                conn_key = (src, dst, sport, dport)
+            
+            # Track SYN packets (scanning)
+                if flags == 'S':  # SYN
+                    scanners[src]['ports'].add(dport)
                     scanners[src]['victims'].add(dst)
                     scanners[src]['packets'].append({
                         'time': packet.time,
                         'dst': dst,
-                        'port': port
+                        'port': dport,
+                        'type': 'SYN'
                     })
-        
+                    connections[conn_key] = 'SYN_SENT'
+            
+            # Track SYN-ACK responses (port is open)
+                elif flags == 'SA':  # SYN-ACK
+                # This is a response from victim to scanner
+                    if dst in scanners:  # dst is the scanner IP
+                        victim_ip = src
+                        scanner_ip = dst
+                        open_port = sport
+                    
+                        scanners[scanner_ip]['open_ports'][victim_ip].add(open_port)
+                        scanners[scanner_ip]['packets'].append({
+                            'time': packet.time,
+                            'dst': victim_ip,
+                            'port': open_port,
+                            'type': 'SYN-ACK',
+                            'status': 'OPEN'
+                        })
+                    
+                    # Track potential handshake completion
+                        reverse_key = (dst, src, dport, sport)  # (scanner, victim, scanner_port, victim_port)
+                        connections[reverse_key] = 'SYN_RCVD'
+            
+            # Track ACK (handshake complete)
+                elif flags == 'A':  # ACK
+                    if conn_key in connections and connections[conn_key] == 'SYN_RCVD':
+                        connections[conn_key] = 'ESTABLISHED'
+                    
+                    # Handshake completed!
+                        scanner_ip = src
+                        victim_ip = dst
+                        victim_port = dport
+                    
+                        scanners[scanner_ip]['established'][victim_ip].append({
+                            'port': victim_port,
+                            'time': packet.time,
+                            'service': self.get_service_name(victim_port)
+                        })
+                    
+                        scanners[scanner_ip]['packets'].append({
+                            'time': packet.time,
+                            'dst': victim_ip,
+                            'port': victim_port,
+                            'type': 'HANDSHAKE_COMPLETE',
+                            'status': 'ESTABLISHED'
+                        })
+            
+            # Track data packets on established connections
+                if packet.haslayer(Raw):
+                    if conn_key in connections and connections[conn_key] == 'ESTABLISHED':
+                        scanner_ip = src
+                        victim_ip = dst
+                        victim_port = dport
+                    
+                    # Check direction of data
+                        if scanner_ip in scanners:  # Attacker sending data
+                            direction = "ATTACKER -> VICTIM"
+                        else:  # Victim sending data (data exfiltration)
+                            scanner_ip = dst
+                            victim_ip = src
+                            victim_port = sport
+                            direction = "VICTIM -> ATTACKER (DATA LEAK)"
+                    
+                        payload = bytes(packet[Raw].load)
+                    
+                    # Try to decode the data
+                        try:
+                            data_str = payload.decode('utf-8', errors='ignore')[:200]
+                        except:
+                            data_str = str(payload)[:200]
+                    
+                        scanners[scanner_ip]['data_captured'][victim_ip].append({
+                            'port': victim_port,
+                            'time': packet.time,
+                            'direction': direction,
+                            'data': data_str,
+                            'size': len(payload)
+                        })
+    
+    # Report findings
         scan_count = 0
+        total_handshakes = 0
+        total_data_packets = 0
+    
         for scanner, data in scanners.items():
             if len(data['ports']) >= self.port_threshold.get():
                 scan_count += 1
                 self.stats['attackers'].add(scanner)
-                
+            
                 self.port_text.insert(tk.END, f"⚠️ SCANNER DETECTED: ", 'critical')
                 self.port_text.insert(tk.END, f"{scanner}\n", 'ip')
-                
+            
                 self.port_text.insert(tk.END, f"   📊 Statistics:\n", 'info')
                 self.port_text.insert(tk.END, f"   • Ports Scanned: {len(data['ports'])}\n", 'warning')
                 self.port_text.insert(tk.END, f"   • Targets: {len(data['victims'])}\n", 'warning')
-                self.port_text.insert(tk.END, f"   • Scan Rate: {len(data['packets'])/10:.1f} pps\n", 'warning')
-                
-                # Show port range
+            
+            # Show port range
                 ports = sorted(data['ports'])
-                self.port_text.insert(tk.END, f"   • Port Range: {ports[0]} - {ports[-1]}\n", 'warning')
+                if len(ports) > 20:
+                    self.port_text.insert(tk.END, f"   • Port Range: {ports[0]} - {ports[-1]} ({len(ports)} total)\n", 'warning')
+                    self.port_text.insert(tk.END, f"   • Sample ports: {ports[:10]} ... {ports[-10:]}\n", 'warning')
+                else:
+                    self.port_text.insert(tk.END, f"   • Ports: {ports}\n", 'warning')
+            
+            # Show open ports for each victim
+                for victim, open_ports in data['open_ports'].items():
+                    self.stats['victims'].add(victim)
                 
-                # Show common ports scanned
-                common_ports = [p for p in ports if p in [21,22,23,25,80,443,445,3389,3306]]
-                if common_ports:
-                    self.port_text.insert(tk.END, f"   • Common Ports: {common_ports}\n", 'critical')
+                    self.port_text.insert(tk.END, f"\n   🎯 TARGET: ", 'critical')
+                    self.port_text.insert(tk.END, f"{victim}\n", 'ip')
                 
-                # Check open ports
-                for victim in data['victims']:
-                    open_ports = self.check_open_ports(scanner, victim)
-                    if open_ports:
-                        self.stats['victims'].add(victim)
-                        self.port_text.insert(tk.END, f"\n   🔓 OPEN PORTS on {victim}:\n", 'critical')
-                        for port in sorted(open_ports):
-                            service = self.get_service_name(port)
+                    self.port_text.insert(tk.END, f"   🔓 OPEN PORTS FOUND:\n", 'warning')
+                    for port in sorted(open_ports):
+                        service = self.get_service_name(port)
+                    
+                        # Check if handshake was completed
+                        handshake_completed = False
+                        for est in data['established'][victim]:
+                            if est['port'] == port:
+                                handshake_completed = True
+                                total_handshakes += 1
+                                break
+                    
+                        if handshake_completed:
                             self.port_text.insert(tk.END, f"      • Port {port}", 'port')
-                            self.port_text.insert(tk.END, f" ({service}) - VULNERABLE\n", 'critical')
-                            
-                            # Add alert
+                            self.port_text.insert(tk.END, f" ({service}) - 🔴 HANDSHAKE COMPLETE\n", 'critical')
+                        else:
+                            self.port_text.insert(tk.END, f"      • Port {port}", 'port')
+                            self.port_text.insert(tk.END, f" ({service}) - 🟢 OPEN\n", 'success')
+                        
+                        # Show captured data for this port
+                        captured = [c for c in data['data_captured'][victim] if c['port'] == port]
+                        if captured:
+                            total_data_packets += len(captured)
+                            self.port_text.insert(tk.END, f"         📥 DATA CAPTURED ({len(captured)} packets):\n", 'critical')
+                            for cap in captured[:3]:  # Show first 3 data packets
+                                self.port_text.insert(tk.END, f"            [{cap['direction']}] ", 'warning')
+                                self.port_text.insert(tk.END, f"{cap['data']}\n", 'info')
+                                
+                                # Add alert for data capture
+                                self.alerts_text.insert(tk.END, 
+                                    f"🚨 Data captured on {victim}:{port} - {cap['direction']}\n", 'critical')
+                    else:
+                        self.port_text.insert(tk.END, f"      • Port {port}", 'port')
+                        self.port_text.insert(tk.END, f" ({service}) - 🟢 OPEN\n", 'success')
+                    
+                    # Add alert for critical open ports
+                    if port in [21, 22, 23, 3389, 3306, 5432, 445, 1433]:
+                        self.alerts_text.insert(tk.END, 
+                            f"🚨 Critical service {service} (port {port}) exposed on {victim}\n", 'critical')
+                        if handshake_completed:
                             self.alerts_text.insert(tk.END, 
-                                f"🚨 Open port {port} ({service}) exposed on {victim}\n", 'critical')
+                                f"   ⚠️ Attacker completed handshake - data may be compromised\n", 'critical')
+            
+            # Show attack summary for this scanner
+            if data['established']:
+                scanner_handshakes = sum(len(ports) for ports in data['established'].values())
+                scanner_data = sum(len(data) for data in data['data_captured'].values())
                 
-                self.port_text.insert(tk.END, "-"*60 + "\n\n")
-        
+                self.port_text.insert(tk.END, f"\n   🔴 ATTACK IMPACT:\n", 'critical')
+                self.port_text.insert(tk.END, f"      • Handshakes completed: {scanner_handshakes}\n", 'critical')
+                
+                if scanner_data > 0:
+                    scanner_bytes = sum(c['size'] for caps in data['data_captured'].values() for c in caps)
+                    self.port_text.insert(tk.END, f"      • Data packets captured: {scanner_data}\n", 'critical')
+                    self.port_text.insert(tk.END, f"      • Total data volume: {scanner_bytes} bytes\n", 'critical')
+            
+            self.port_text.insert(tk.END, "-"*60 + "\n\n")
+    
+    # Update statistics
         self.stats['port_scans'] = scan_count
+    
+    # Show overall summary
+        self.port_text.insert(tk.END, "\n" + "="*80 + "\n", 'info')
+        self.port_text.insert(tk.END, "📊 SCAN SUMMARY\n", 'warning')
+        self.port_text.insert(tk.END, "="*80 + "\n", 'info')
+        self.port_text.insert(tk.END, f"Total scanners detected: {scan_count}\n", 'warning')
+    
+        if total_handshakes > 0:
+            self.port_text.insert(tk.END, f"Total completed handshakes: {total_handshakes} - ", 'critical')
+            self.port_text.insert(tk.END, f"🔴 ATTACKER CONNECTED\n", 'critical')
+    
+        if total_data_packets > 0:
+            self.port_text.insert(tk.END, f"Total data packets captured: {total_data_packets} - ", 'critical')
+            self.port_text.insert(tk.END, f"🔴 DATA COMPROMISED\n", 'critical')
+    
+        self.port_text.insert(tk.END, "="*80 + "\n", 'info')
         
     def enhanced_bruteforce_analysis(self):
         """Enhanced brute-force detection with pattern analysis"""
