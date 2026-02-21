@@ -251,17 +251,144 @@ class PCAPAnalyzerGUI:
         self.creds_text.tag_config('info', foreground='#8888ff')
         self.creds_text.tag_config('username', foreground='#50fa7b')
         self.creds_text.tag_config('password', foreground='#ff79c6')
-        
+    def analyze_timeline(self):
+
+        if not self.packets:
+            return
+    
+        timeline = []
+    
+    # Get time range
+        start_time = float(self.packets[0].time)
+    
+        for packet in self.packets:
+            if packet.haslayer(IP) and packet.haslayer(TCP):
+                relative_time = float(packet.time) - start_time
+                src = packet[IP].src
+                dst = packet[IP].dst
+                dport = packet[TCP].dport
+            
+            # Track SYN packets (potential scan)
+                if packet[TCP].flags == 'S':
+                    timeline.append({
+                        'time': relative_time,
+                        'type': 'SYN',
+                        'src': src,
+                        'dst': dst,
+                        'port': dport,
+                        'desc': f"SYN to {dst}:{dport}"
+                    })
+            
+            # Track failed logins (brute-force)
+                if packet.haslayer(Raw):
+                    payload = bytes(packet[Raw].load).lower()
+                    failure_patterns = [b'530', b'failed', b'invalid', b'denied']
+                    for pattern in failure_patterns:
+                        if pattern in payload:
+                            timeline.append({
+                                'time': relative_time,
+                                'type': 'FAILED_LOGIN',
+                                'src': src,
+                                'dst': dst,
+                                'port': dport,
+                                'desc': f"Failed login from {src} to {dst}:{dport}"
+                            })
+                            break
+    
+    # Sort by time
+        timeline.sort(key=lambda x: x['time'])
+        return timeline
+    
     def create_timeline_tab(self):
         """Timeline of events"""
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="⏱️ TIMELINE")
-        
+    
+    # Control buttons
+        control_frame = tk.Frame(tab, bg='#333333')
+        control_frame.pack(fill=tk.X, padx=5, pady=5)
+    
+        tk.Button(control_frame, text="▶ Generate Timeline", 
+                command=self.generate_timeline,
+                bg='#2196F3', fg='white').pack(side=tk.LEFT, padx=5)
+    
+        tk.Button(control_frame, text="📋 Export Timeline", 
+                command=lambda: self.export_results('timeline'),
+                bg='#4CAF50', fg='white').pack(side=tk.LEFT, padx=5)
+    
+    # Timeline display
         self.timeline_text = scrolledtext.ScrolledText(tab, wrap=tk.WORD,
-                                                       bg='#1e1e1e', fg='white',
-                                                       font=('Consolas', 10))
+                                                        bg='#1e1e1e', fg='white',
+                                                        font=('Consolas', 10))
         self.timeline_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+    # Configure tags for timeline
+        self.timeline_text.tag_config('syn', foreground='#FFA500', font=('Consolas', 10, 'bold'))
+        self.timeline_text.tag_config('failed', foreground='#FF4444')
+        self.timeline_text.tag_config('success', foreground='#44FF44')
+        self.timeline_text.tag_config('time', foreground='#8888FF')
+        self.timeline_text.tag_config('event', foreground='#FFFFFF')
+    def generate_timeline(self):
+        """Generate and display timeline"""
+        if not self.pcap_file:
+            messagebox.showerror("Error", "Please select a PCAP file first!")
+            return
+    
+        self.timeline_text.delete(1.0, tk.END)
+    
+    # Show header
+        self.timeline_text.insert(tk.END, "="*80 + "\n", 'time')
+        self.timeline_text.insert(tk.END, "EVENT TIMELINE\n", 'syn')
+        self.timeline_text.insert(tk.END, "="*80 + "\n\n", 'time')
+    
+    # Get timeline events
+        timeline = self.analyze_timeline()
+    
+        if not timeline:
+            self.timeline_text.insert(tk.END, "No significant events found in timeline.\n", 'event')
+            return
+    
+    # Group events by time intervals
+        current_time = 0
+        events_by_second = defaultdict(list)
+    
+        for event in timeline:
+            second = int(event['time'])
+            events_by_second[second].append(event)
+    
+    # Display timeline
+        for second in sorted(events_by_second.keys()):
+        # Show time marker
+            time_str = f"[T+{second:04d}s] "
+            self.timeline_text.insert(tk.END, time_str, 'time')
         
+        # Show events at this second
+            events = events_by_second[second]
+            for i, event in enumerate(events):
+                if i > 0:
+                    self.timeline_text.insert(tk.END, " " * len(time_str))
+            
+                if event['type'] == 'SYN':
+                    self.timeline_text.insert(tk.END, f"🔍 {event['desc']}\n", 'syn')
+                elif event['type'] == 'FAILED_LOGIN':
+                    self.timeline_text.insert(tk.END, f"🔑 {event['desc']}\n", 'failed')
+                else:
+                    self.timeline_text.insert(tk.END, f"• {event['desc']}\n", 'event')
+    
+    # Summary
+        self.timeline_text.insert(tk.END, "\n" + "="*80 + "\n", 'time')
+        self.timeline_text.insert(tk.END, f"TIMELINE SUMMARY\n", 'syn')
+        self.timeline_text.insert(tk.END, "="*80 + "\n", 'time')
+        self.timeline_text.insert(tk.END, f"Total events: {len(timeline)}\n", 'event')
+        self.timeline_text.insert(tk.END, f"Time span: {int(timeline[-1]['time'])} seconds\n", 'event')
+    
+    # Count by type
+        syn_count = len([e for e in timeline if e['type'] == 'SYN'])
+        fail_count = len([e for e in timeline if e['type'] == 'FAILED_LOGIN'])
+    
+        self.timeline_text.insert(tk.END, f"SYN packets: {syn_count}\n", 'syn')
+        self.timeline_text.insert(tk.END, f"Failed logins: {fail_count}\n", 'failed')   
+
     def create_reports_tab(self):
         """Generate reports"""
         tab = ttk.Frame(self.notebook)
@@ -340,6 +467,7 @@ class PCAPAnalyzerGUI:
             self.enhanced_port_scan_analysis()
             self.enhanced_bruteforce_analysis()
             self.enhanced_credentials_analysis()
+            self.generate_timeline()
             
             # Update dashboard
             self.root.after(0, self.update_dashboard)
@@ -601,27 +729,33 @@ class PCAPAnalyzerGUI:
         self.stat_cards["🔐 Credentials"].config(text=str(self.stats['credentials']))
         self.stat_cards["👥 Attackers"].config(text=str(len(self.stats['attackers'])))
         self.stat_cards["🎯 Victims"].config(text=str(len(self.stats['victims'])))
-        
     def export_results(self, analysis_type):
         """Export results to file"""
         filename = filedialog.asksaveasfilename(
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
         )
-        
+    
         if filename:
             try:
-                with open(filename, 'w') as f:
+                with open(filename, 'w', encoding='utf-8') as f:
                     if analysis_type == 'port':
                         f.write(self.port_text.get(1.0, tk.END))
                     elif analysis_type == 'brute':
                         f.write(self.brute_text.get(1.0, tk.END))
                     elif analysis_type == 'creds':
                         f.write(self.creds_text.get(1.0, tk.END))
-                
+                    elif analysis_type == 'timeline':  # Add this
+                        f.write(self.timeline_text.get(1.0, tk.END))
+            
                 messagebox.showinfo("Success", f"Results exported to {filename}")
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to export: {str(e)}")
+                messagebox.showerror("Error", f"Failed to export: {str(e)}")    
+    
+
+
+            
+            
                 
     def generate_report(self):
         """Generate summary report"""
