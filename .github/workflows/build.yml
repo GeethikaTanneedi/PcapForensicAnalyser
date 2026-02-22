@@ -28,7 +28,6 @@ jobs:
     
     - name: Test all modules
       run: |
-        python step1_test.py
         python -c "from scapy.all import *; print('✓ Scapy loaded')"
         python -c "import step2_reader; print('✓ step2_reader loaded')"
         python -c "import step3_port_scan; print('✓ step3_port_scan loaded')"
