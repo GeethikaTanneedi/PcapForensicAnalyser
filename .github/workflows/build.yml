@@ -1,0 +1,138 @@
+name: PCAP Forensic Analyzer Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  release:
+    types: [created]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install scapy
+        sudo apt-get update
+        sudo apt-get install -y libpcap-dev
+    
+    - name: Test all modules
+      run: |
+        python step1_test.py
+        python -c "from scapy.all import *; print('✓ Scapy loaded')"
+        python -c "import step2_reader; print('✓ step2_reader loaded')"
+        python -c "import step3_port_scan; print('✓ step3_port_scan loaded')"
+        python -c "import step4_bruteforce; print('✓ step4_bruteforce loaded')"
+        python -c "import step5_credentials; print('✓ step5_credentials loaded')"
+        python -c "import pcap_analyzer_gui; print('✓ GUI module loaded')"
+    
+    - name: Test with sample PCAP
+      run: |
+        python create_test_pcap.py
+        python step3_port_scan.py test.pcap --threshold 3 || true
+        python step4_bruteforce.py test.pcap --threshold 2 || true
+        python step5_credentials.py test.pcap || true
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    if: github.event_name == 'release'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        pip install scapy pyinstaller
+    
+    - name: Build Windows Executables
+      run: |
+        # Build GUI
+        pyinstaller --onefile --windowed --name "PCAP_Forensic_Analyzer" pcap_analyzer_gui.py
+        
+        # Build CLI tools
+        pyinstaller --onefile --name "port_scan" step3_port_scan.py
+        pyinstaller --onefile --name "bruteforce" step4_bruteforce.py
+        pyinstaller --onefile --name "credentials" step5_credentials.py
+        pyinstaller --onefile --name "pcap_reader" step2_reader.py
+    
+    - name: Upload Windows artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: PCAP-Analyzer-Windows
+        path: |
+          dist/*.exe
+          *.pcap
+          README.md
+
+  build-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        pip install scapy pyinstaller
+        sudo apt-get update
+        sudo apt-get install -y libpcap-dev python3-tk
+    
+    - name: Build Linux Executable
+      run: |
+        pyinstaller --onefile --name "pcap-analyzer-gui" pcap_analyzer_gui.py
+    
+    - name: Upload Linux artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: PCAP-Analyzer-Linux
+        path: |
+          dist/pcap-analyzer-gui
+          *.pcap
+
+  create-release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Create release archive
+      run: |
+        mkdir release
+        cp artifacts/PCAP-Analyzer-Windows/*.exe release/ 2>/dev/null || true
+        cp artifacts/PCAP-Analyzer-Linux/pcap-analyzer-gui release/ 2>/dev/null || true
+        cp *.pcap release/ 2>/dev/null || true
+        cp README.md release/
+    
+    - name: Upload release assets
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          release/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
