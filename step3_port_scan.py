@@ -279,7 +279,11 @@ def main():
         print(f"[!] Error loading file: {e}")
     
     print("\n" + "=" * 70)
-    input("Press Enter to exit...")
+    import sys
+    if sys.stdin.isatty():
+        import sys
+    if sys.stdin.isatty():
+        input("Press Enter to exit...")
 
 if __name__ == "__main__":
     main()
