@@ -40,4 +40,6 @@ def analyze_pcap(filename):
 # Run the analysis
 if __name__ == "__main__":
     analyze_pcap("test.pcap")
-    input("\nPress Enter to exit...")
+    import sys
+    if sys.stdin.isatty():
+        input("\nPress Enter to exit...")

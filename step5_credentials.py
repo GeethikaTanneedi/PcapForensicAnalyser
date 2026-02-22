@@ -271,5 +271,9 @@ def main():
     if sys.stdin.isatty():
         input("Press Enter to exit...")
 
+
 if __name__ == "__main__":
     main()
+    import sys
+    if sys.stdin.isatty():
+        input("\nPress Enter to exit...")
